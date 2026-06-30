@@ -1,4 +1,5 @@
-import anthropic
+from google import genai
+from google.genai import types
 import requests
 import json
 import math
@@ -7,7 +8,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
 
 # ─────────────────────────────────────────────
 # TOOLS  (functions the agent can call)
@@ -41,7 +42,7 @@ def web_search(query: str) -> str:
 
 
 def calculate(expression: str) -> str:
-    """Safely evaluate a math expression."""
+    """Safely evaluate a math expression. Use Python math syntax like '2 ** 10' or 'sqrt(144)'."""
     try:
         # Only allow safe math operations
         allowed = {k: getattr(math, k) for k in dir(math) if not k.startswith("_")}
@@ -97,62 +98,19 @@ def get_weather(city: str) -> str:
         return f"Weather fetch failed: {str(e)}"
 
 
-# ─────────────────────────────────────────────
-# TOOL DEFINITIONS  (sent to Claude so it knows what tools exist)
-# ─────────────────────────────────────────────
+# Map tool names to functions
+TOOL_FUNCTIONS = {
+    "web_search": web_search,
+    "calculate": calculate,
+    "get_weather": get_weather,
+}
 
-TOOLS = [
-    {
-        "name": "web_search",
-        "description": "Search the web for current information on any topic.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "The search query"}
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "calculate",
-        "description": "Evaluate a mathematical expression. Use Python math syntax.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "expression": {
-                    "type": "string",
-                    "description": "Math expression e.g. '2 ** 10' or 'sqrt(144)'",
-                }
-            },
-            "required": ["expression"],
-        },
-    },
-    {
-        "name": "get_weather",
-        "description": "Get the current weather for any city in the world.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "city": {"type": "string", "description": "City name e.g. 'London'"}
-            },
-            "required": ["city"],
-        },
-    },
-]
-
-# ─────────────────────────────────────────────
-# TOOL ROUTER  (calls the right function)
-# ─────────────────────────────────────────────
 
 def run_tool(tool_name: str, tool_input: dict) -> str:
-    if tool_name == "web_search":
-        return web_search(tool_input["query"])
-    elif tool_name == "calculate":
-        return calculate(tool_input["expression"])
-    elif tool_name == "get_weather":
-        return get_weather(tool_input["city"])
-    else:
-        return f"Unknown tool: {tool_name}"
+    func = TOOL_FUNCTIONS.get(tool_name)
+    if func:
+        return func(**tool_input)
+    return f"Unknown tool: {tool_name}"
 
 
 # ─────────────────────────────────────────────
@@ -162,60 +120,82 @@ def run_tool(tool_name: str, tool_input: dict) -> str:
 def run_agent(user_message: str) -> str:
     """
     Agentic loop:
-    1. Send user message + tools to Claude
-    2. If Claude wants to use a tool → run it → send result back
-    3. Repeat until Claude gives a final text answer
+    1. Send user message + tools to Gemini
+    2. If Gemini wants to use a tool → run it → send result back
+    3. Repeat until Gemini gives a final text answer
     """
     print(f"\n{'='*50}")
     print(f"You: {user_message}")
     print(f"{'='*50}")
 
-    messages = [{"role": "user", "content": user_message}]
+    # Define tools as the Python functions themselves
+    gemini_tools = [web_search, calculate, get_weather]
 
-    while True:
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=1024,
-            tools=TOOLS,
-            messages=messages,
+    contents = [
+        types.Content(
+            role="user",
+            parts=[types.Part.from_text(text=user_message)],
+        )
+    ]
+
+    max_iterations = 10
+
+    for _ in range(max_iterations):
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=contents,
+            config=types.GenerateContentConfig(
+                tools=gemini_tools,
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                    disable=True,
+                ),
+            ),
         )
 
-        # If Claude is done → return the text answer
-        if response.stop_reason == "end_turn":
-            final_text = ""
-            for block in response.content:
-                if hasattr(block, "text"):
-                    final_text += block.text
+        # Check for function calls
+        has_function_calls = False
+        function_call_parts = []
+
+        if response.candidates and response.candidates[0].content:
+            for part in response.candidates[0].content.parts:
+                if part.function_call:
+                    has_function_calls = True
+                    function_call_parts.append(part)
+
+        # If no tool calls → return the text answer
+        if not has_function_calls:
+            final_text = response.text or "Agent stopped unexpectedly."
             print(f"\nAgent: {final_text}")
             return final_text
 
-        # If Claude wants to use tools
-        if response.stop_reason == "tool_use":
-            # Add Claude's response to conversation history
-            messages.append({"role": "assistant", "content": response.content})
+        # Process function calls
+        contents.append(response.candidates[0].content)
 
-            # Process each tool call
-            tool_results = []
-            for block in response.content:
-                if block.type == "tool_use":
-                    print(f"\n  [Tool call] {block.name}({block.input})")
-                    result = run_tool(block.name, block.input)
-                    print(f"  [Tool result] {result}")
+        function_response_parts = []
+        for part in function_call_parts:
+            fc = part.function_call
+            tool_name = fc.name
+            tool_args = dict(fc.args) if fc.args else {}
 
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": result,
-                    })
+            print(f"\n  [Tool call] {tool_name}({tool_args})")
+            result = run_tool(tool_name, tool_args)
+            print(f"  [Tool result] {result}")
 
-            # Send tool results back to Claude
-            messages.append({"role": "user", "content": tool_results})
+            function_response_parts.append(
+                types.Part.from_function_response(
+                    name=tool_name,
+                    response={"result": result},
+                )
+            )
 
-        else:
-            # Unexpected stop reason
-            break
+        contents.append(
+            types.Content(
+                role="user",
+                parts=function_response_parts,
+            )
+        )
 
-    return "Agent stopped unexpectedly."
+    return "Agent reached the maximum number of steps."
 
 
 # ─────────────────────────────────────────────
@@ -224,7 +204,8 @@ def run_agent(user_message: str) -> str:
 
 if __name__ == "__main__":
     print("╔══════════════════════════════════════╗")
-    print("║        AI Agent  —  ready!           ║")
+    print("║     ToolMind AI Agent  —  ready!     ║")
+    print("║  Model: Gemini 2.5 Flash (free)      ║")
     print("║  Tools: web search, calculator,      ║")
     print("║         weather                      ║")
     print("║  Type 'quit' to exit                 ║")

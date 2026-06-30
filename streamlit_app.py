@@ -1,5 +1,6 @@
 import streamlit as st
-import anthropic
+from google import genai
+from google.genai import types
 import requests
 import math
 import os
@@ -12,7 +13,7 @@ load_dotenv()
 # ─────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="AI Agent",
+    page_title="ToolMind AI Agent",
     page_icon="🤖",
     layout="centered",
 )
@@ -56,10 +57,11 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────
-# TOOLS
+# TOOLS (Python functions)
 # ─────────────────────────────────────────────
 
 def web_search(query: str) -> str:
+    """Search the web for current information on any topic using DuckDuckGo."""
     try:
         url = "https://api.duckduckgo.com/"
         params = {"q": query, "format": "json", "no_html": 1, "skip_disambig": 1}
@@ -77,6 +79,7 @@ def web_search(query: str) -> str:
 
 
 def calculate(expression: str) -> str:
+    """Evaluate a mathematical expression. Use Python math syntax like '2 ** 10' or 'sqrt(144)'."""
     try:
         allowed = {k: getattr(math, k) for k in dir(math) if not k.startswith("_")}
         allowed["abs"] = abs
@@ -88,6 +91,7 @@ def calculate(expression: str) -> str:
 
 
 def get_weather(city: str) -> str:
+    """Get the current weather for any city in the world."""
     try:
         geo_resp = requests.get(
             "https://geocoding-api.open-meteo.com/v1/search",
@@ -120,46 +124,21 @@ def get_weather(city: str) -> str:
         return f"Weather fetch failed: {str(e)}"
 
 
-TOOLS = [
-    {
-        "name": "web_search",
-        "description": "Search the web for current information on any topic.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"query": {"type": "string", "description": "The search query"}},
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "calculate",
-        "description": "Evaluate a mathematical expression. Use Python math syntax.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"expression": {"type": "string", "description": "e.g. '2 ** 10' or 'sqrt(144)'"}},
-            "required": ["expression"],
-        },
-    },
-    {
-        "name": "get_weather",
-        "description": "Get the current weather for any city in the world.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"city": {"type": "string", "description": "City name e.g. 'London'"}},
-            "required": ["city"],
-        },
-    },
-]
+# Map tool names to their Python functions
+TOOL_FUNCTIONS = {
+    "web_search": web_search,
+    "calculate": calculate,
+    "get_weather": get_weather,
+}
 
 TOOL_ICONS = {"web_search": "🔍", "calculate": "🧮", "get_weather": "🌤️"}
 
 
 def run_tool(name: str, inputs: dict) -> str:
-    if name == "web_search":
-        return web_search(inputs["query"])
-    elif name == "calculate":
-        return calculate(inputs["expression"])
-    elif name == "get_weather":
-        return get_weather(inputs["city"])
+    """Execute a tool by name with the given inputs."""
+    func = TOOL_FUNCTIONS.get(name)
+    if func:
+        return func(**inputs)
     return f"Unknown tool: {name}"
 
 
@@ -170,54 +149,101 @@ def run_tool(name: str, inputs: dict) -> str:
 def run_agent_stream(user_message: str, api_key: str):
     """
     Generator that yields dicts describing each step of the agent loop.
-    Types: "thinking", "tool_call", "tool_result", "answer"
+    Types: "thinking", "tool_call", "tool_result", "answer", "error"
+    Uses Google Gemini API with manual function calling.
     """
-    client = anthropic.Anthropic(api_key=api_key)
-    messages = [{"role": "user", "content": user_message}]
+    client = genai.Client(api_key=api_key)
 
-    while True:
-        yield {"type": "thinking", "text": "Claude is thinking..."}
+    # Define the tools for Gemini using the Python functions directly
+    gemini_tools = [web_search, calculate, get_weather]
+
+    # Build conversation contents
+    contents = [
+        types.Content(
+            role="user",
+            parts=[types.Part.from_text(text=user_message)],
+        )
+    ]
+
+    max_iterations = 10  # Safety limit to prevent infinite loops
+
+    for _ in range(max_iterations):
+        yield {"type": "thinking", "text": "Gemini is thinking..."}
 
         try:
-            response = client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=1024,
-                tools=TOOLS,
-                messages=messages,
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    tools=gemini_tools,
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                        disable=True,  # We handle tool calls manually for UI display
+                    ),
+                ),
             )
-        except anthropic.AuthenticationError:
-            yield {"type": "error", "text": "❌ **Invalid API key.** Please check your Anthropic API key and try again."}
-            return
-        except anthropic.APIError as e:
-            yield {"type": "error", "text": f"❌ **API error:** {e.message}"}
+        except Exception as e:
+            error_msg = str(e)
+            if "API_KEY_INVALID" in error_msg or "401" in error_msg or "PERMISSION_DENIED" in error_msg:
+                yield {"type": "error", "text": "❌ **Invalid API key.** Please check your Google Gemini API key and try again. Get one free at [aistudio.google.com](https://aistudio.google.com/apikey)"}
+            else:
+                yield {"type": "error", "text": f"❌ **API error:** {error_msg}"}
             return
 
-        if response.stop_reason == "end_turn":
-            final_text = "".join(
-                block.text for block in response.content if hasattr(block, "text")
+        # Check if there are any function calls in the response
+        has_function_calls = False
+        function_call_parts = []
+        text_parts = []
+
+        if response.candidates and response.candidates[0].content:
+            for part in response.candidates[0].content.parts:
+                if part.function_call:
+                    has_function_calls = True
+                    function_call_parts.append(part)
+                elif part.text:
+                    text_parts.append(part.text)
+
+        if not has_function_calls:
+            # No tool calls — extract the final text answer
+            final_text = response.text if response.text else "".join(text_parts)
+            if final_text:
+                yield {"type": "answer", "text": final_text}
+            else:
+                yield {"type": "answer", "text": "Agent stopped unexpectedly."}
+            return
+
+        # Process function calls
+        # Add the model's response (with function calls) to contents
+        contents.append(response.candidates[0].content)
+
+        # Execute each function call and collect results
+        function_response_parts = []
+
+        for part in function_call_parts:
+            fc = part.function_call
+            tool_name = fc.name
+            tool_args = dict(fc.args) if fc.args else {}
+
+            yield {"type": "tool_call", "name": tool_name, "input": tool_args}
+            result = run_tool(tool_name, tool_args)
+            yield {"type": "tool_result", "name": tool_name, "result": result}
+
+            function_response_parts.append(
+                types.Part.from_function_response(
+                    name=tool_name,
+                    response={"result": result},
+                )
             )
-            yield {"type": "answer", "text": final_text}
-            return
 
-        if response.stop_reason == "tool_use":
-            messages.append({"role": "assistant", "content": response.content})
-            tool_results = []
+        # Add tool results back to the conversation
+        contents.append(
+            types.Content(
+                role="user",
+                parts=function_response_parts,
+            )
+        )
 
-            for block in response.content:
-                if block.type == "tool_use":
-                    yield {"type": "tool_call", "name": block.name, "input": block.input}
-                    result = run_tool(block.name, block.input)
-                    yield {"type": "tool_result", "name": block.name, "result": result}
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": result,
-                    })
-
-            messages.append({"role": "user", "content": tool_results})
-        else:
-            yield {"type": "answer", "text": "Agent stopped unexpectedly."}
-            return
+    # If we hit the iteration limit
+    yield {"type": "answer", "text": "Agent reached the maximum number of steps."}
 
 
 # ─────────────────────────────────────────────
@@ -230,15 +256,15 @@ with st.sidebar:
     # API key: prioritize st.secrets (Streamlit Cloud), then env var, then manual input
     default_key = ""
     try:
-        default_key = st.secrets["ANTHROPIC_API_KEY"]
+        default_key = st.secrets["GOOGLE_API_KEY"]
     except (KeyError, FileNotFoundError):
-        default_key = os.getenv("ANTHROPIC_API_KEY", "")
+        default_key = os.getenv("GOOGLE_API_KEY", "")
 
     api_key = st.text_input(
-        "Anthropic API Key",
+        "Google Gemini API Key",
         value=default_key,
         type="password",
-        help="Get yours at console.anthropic.com",
+        help="Get yours free at aistudio.google.com/apikey",
     )
 
     st.divider()
@@ -268,14 +294,14 @@ with st.sidebar:
         st.session_state.messages = []
         st.rerun()
 
-    st.caption("Built with Claude claude-sonnet-4-6 · [GitHub](https://github.com)")
+    st.caption("Built with Gemini 2.5 Flash · [GitHub](https://github.com)")
 
 # ─────────────────────────────────────────────
 # MAIN PAGE
 # ─────────────────────────────────────────────
 
-st.title("🤖 AI Agent")
-st.caption("An autonomous agent that searches the web, does math, and checks weather.")
+st.title("🤖 ToolMind AI Agent")
+st.caption("An autonomous agent that searches the web, does math, and checks weather — powered by Gemini 2.5 Flash (free).")
 
 # Init chat history
 if "messages" not in st.session_state:
@@ -311,7 +337,7 @@ user_input = st.chat_input("Ask me anything...") or prefill
 
 if user_input:
     if not api_key:
-        st.error("Please enter your Anthropic API key in the sidebar.")
+        st.error("Please enter your Google Gemini API key in the sidebar. Get one free at [aistudio.google.com/apikey](https://aistudio.google.com/apikey)")
         st.stop()
 
     # Show user message
