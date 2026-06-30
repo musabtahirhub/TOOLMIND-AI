@@ -178,12 +178,19 @@ def run_agent_stream(user_message: str, api_key: str):
     while True:
         yield {"type": "thinking", "text": "Claude is thinking..."}
 
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=1024,
-            tools=TOOLS,
-            messages=messages,
-        )
+        try:
+            response = client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=1024,
+                tools=TOOLS,
+                messages=messages,
+            )
+        except anthropic.AuthenticationError:
+            yield {"type": "error", "text": "❌ **Invalid API key.** Please check your Anthropic API key and try again."}
+            return
+        except anthropic.APIError as e:
+            yield {"type": "error", "text": f"❌ **API error:** {e.message}"}
+            return
 
         if response.stop_reason == "end_turn":
             final_text = "".join(
@@ -220,10 +227,16 @@ def run_agent_stream(user_message: str, api_key: str):
 with st.sidebar:
     st.title("⚙️ Settings")
 
-    # API key input
+    # API key: prioritize st.secrets (Streamlit Cloud), then env var, then manual input
+    default_key = ""
+    try:
+        default_key = st.secrets["ANTHROPIC_API_KEY"]
+    except (KeyError, FileNotFoundError):
+        default_key = os.getenv("ANTHROPIC_API_KEY", "")
+
     api_key = st.text_input(
         "Anthropic API Key",
-        value=os.getenv("ANTHROPIC_API_KEY", ""),
+        value=default_key,
         type="password",
         help="Get yours at console.anthropic.com",
     )
@@ -332,6 +345,11 @@ if user_input:
                 tool_html += f'<div class="tool-result">↳ {step["result"]}</div>'
                 tool_placeholder.markdown(tool_html, unsafe_allow_html=True)
                 steps.append(step)
+
+            elif step["type"] == "error":
+                tool_placeholder.empty()
+                st.error(step["text"])
+                st.stop()
 
             elif step["type"] == "answer":
                 answer = step["text"]
